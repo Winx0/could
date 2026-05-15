@@ -64,8 +64,41 @@ WALLET_ENDPOINT = "https://login.blockchain.com/wallet/{guid}?format=json"
 
 
 def parse_input_file(path):
-    """Extract all UUIDs from input file."""
-    text = Path(path).read_text(encoding='utf-8', errors='replace')
+    """Extract all UUIDs from input file.
+
+    Handles multiple encodings:
+      - UTF-8 (Linux/Mac)
+      - UTF-16 LE (Windows PowerShell '>' redirect default)
+      - UTF-16 BE (less common)
+      - CP1252 (legacy Windows)
+
+    Returns (v4_uuids, other_uuids).
+    """
+    raw = Path(path).read_bytes()
+
+    # Strip BOM if present
+    if raw.startswith(b'\xff\xfe'):
+        text = raw[2:].decode('utf-16-le', errors='replace')
+    elif raw.startswith(b'\xfe\xff'):
+        text = raw[2:].decode('utf-16-be', errors='replace')
+    elif raw.startswith(b'\xef\xbb\xbf'):
+        text = raw[3:].decode('utf-8', errors='replace')
+    else:
+        # No BOM. Try encodings in order of likelihood.
+        text = ''
+        best_count = 0
+        for enc in ('utf-8', 'utf-16-le', 'utf-16-be', 'cp1252', 'latin-1'):
+            try:
+                decoded = raw.decode(enc, errors='strict')
+                count = len(UUID_ANY.findall(decoded))
+                if count > best_count:
+                    best_count = count
+                    text = decoded
+            except UnicodeDecodeError:
+                continue
+        if not text:
+            text = raw.decode('utf-8', errors='replace')
+
     ids = set(m.lower() for m in UUID_ANY.findall(text))
     v4 = [u for u in ids if UUID_V4.match(u)]
     other = [u for u in ids if not UUID_V4.match(u)]
