@@ -40,10 +40,23 @@ import urllib.request
 from collections import Counter, defaultdict
 from pathlib import Path
 
-# Public APIs - no key needed
-MEMPOOL_TX = "https://mempool.space/api/tx/{txid}"
-MEMPOOL_ADDR = "https://mempool.space/api/address/{addr}"
-MEMPOOL_ADDR_TXS = "https://mempool.space/api/address/{addr}/txs"
+# Public APIs - no key needed (with fallbacks)
+API_ENDPOINTS = [
+    {
+        'name': 'mempool.space',
+        'tx': "https://mempool.space/api/tx/{txid}",
+        'addr_txs': "https://mempool.space/api/address/{addr}/txs",
+    },
+    {
+        'name': 'blockstream.info',
+        'tx': "https://blockstream.info/api/tx/{txid}",
+        'addr_txs': "https://blockstream.info/api/address/{addr}/txs",
+    },
+]
+
+# Backward compatibility
+MEMPOOL_TX = API_ENDPOINTS[0]['tx']
+MEMPOOL_ADDR_TXS = API_ENDPOINTS[0]['addr_txs']
 
 # Address patterns
 LEGACY_PATTERN = re.compile(r'^1[1-9A-HJ-NP-Za-km-z]{25,33}$')
@@ -114,47 +127,101 @@ SERVICE_PATTERNS = {
 }
 
 
-def fetch_json(url, timeout=15, retries=3):
-    """Fetch JSON from URL with retry."""
+def fetch_json(url, timeout=15, retries=3, verbose=False):
+    """Fetch JSON from URL with retry. Returns (data, error_msg)."""
+    last_error = None
     for attempt in range(retries):
         try:
             req = urllib.request.Request(
                 url,
-                headers={'User-Agent': 'fingerprint-tool/1.0'}
+                headers={'User-Agent': 'Mozilla/5.0 (compatible; recovery-tool/1.0)'}
             )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read())
+                return json.loads(resp.read()), None
         except urllib.error.HTTPError as e:
+            last_error = f"HTTP {e.code}"
             if e.code == 429:
-                time.sleep(15)  # rate limit cooldown
+                if verbose:
+                    print(f"      Rate limited, waiting 15s...")
+                time.sleep(15)
                 continue
             if attempt < retries - 1:
                 time.sleep(2)
                 continue
-            return None
-        except Exception:
+        except urllib.error.URLError as e:
+            last_error = f"URLError: {e.reason}"
             if attempt < retries - 1:
                 time.sleep(2)
                 continue
-            return None
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {str(e)[:100]}"
+            if attempt < retries - 1:
+                time.sleep(2)
+                continue
+    return None, last_error
+
+
+def fetch_with_fallback(url_template, **kwargs):
+    """Try multiple API endpoints until one works."""
+    errors = []
+    # Determine which key in API_ENDPOINTS based on template
+    is_addr_txs = '/address/' in url_template
+    is_tx = '/tx/' in url_template and '/address/' not in url_template
+
+    endpoint_key = 'addr_txs' if is_addr_txs else ('tx' if is_tx else None)
+
+    if endpoint_key:
+        for ep in API_ENDPOINTS:
+            url = ep[endpoint_key].format(**kwargs)
+            data, err = fetch_json(url, verbose=True)
+            if data is not None:
+                return data
+            errors.append(f"{ep['name']}: {err}")
+    else:
+        data, err = fetch_json(url_template.format(**kwargs))
+        if data is not None:
+            return data
+        errors.append(err)
+
+    print(f"  ERROR fetching: {url_template[:60]}")
+    for e in errors:
+        print(f"    - {e}")
     return None
 
 
-def get_funding_tx(addr):
-    """Get the first transaction that funded this address."""
-    print(f"  Fetching tx history for {addr}...")
-    txs = fetch_json(MEMPOOL_ADDR_TXS.format(addr=addr))
-    if not txs:
+def get_funding_tx(addr, txid_override=None):
+    """Get the first transaction that funded this address.
+    If txid_override is given, fetch that specific tx instead.
+    """
+    if txid_override:
+        print(f"  Using provided TXID: {txid_override}")
+        for ep in API_ENDPOINTS:
+            url = ep['tx'].format(txid=txid_override)
+            data, err = fetch_json(url, verbose=True)
+            if data is not None:
+                print(f"  Fetched via {ep['name']}")
+                return data
+            print(f"  {ep['name']}: {err}")
         return None
-    # Find oldest tx where this address is in vout (received)
-    funding_txs = []
-    for tx in reversed(txs):  # oldest first
-        for vout in tx.get('vout', []):
-            if vout.get('scriptpubkey_address') == addr:
-                funding_txs.append(tx)
-                break
-    if funding_txs:
-        return funding_txs[0]
+
+    print(f"  Fetching tx history for {addr}...")
+    for ep in API_ENDPOINTS:
+        url = ep['addr_txs'].format(addr=addr)
+        data, err = fetch_json(url, verbose=True)
+        if data is not None:
+            print(f"  Fetched via {ep['name']}")
+            txs = data
+            # Find oldest tx where this address is in vout (received)
+            funding_txs = []
+            for tx in reversed(txs):  # oldest first
+                for vout in tx.get('vout', []):
+                    if vout.get('scriptpubkey_address') == addr:
+                        funding_txs.append(tx)
+                        break
+            if funding_txs:
+                return funding_txs[0]
+            return None
+        print(f"  {ep['name']}: {err}")
     return None
 
 
@@ -190,7 +257,13 @@ def trace_spend_destination(addr, max_hops=2):
     For an address that has been spent FROM, find where it sent BTC.
     Returns list of destination addresses (from first spending tx).
     """
-    txs = fetch_json(MEMPOOL_ADDR_TXS.format(addr=addr))
+    txs = None
+    for ep in API_ENDPOINTS:
+        url = ep['addr_txs'].format(addr=addr)
+        data, err = fetch_json(url)
+        if data is not None:
+            txs = data
+            break
     if not txs:
         return None, None
 
@@ -221,20 +294,33 @@ def label_destination(dest_addr):
     return None
 
 
-def fingerprint_analysis(target_addr, sample_size=50, delay=1.5):
+def fingerprint_analysis(target_addr, sample_size=50, delay=1.5, txid_override=None):
     """Main analysis pipeline."""
     print("=" * 70)
     print("ADDRESS FINGERPRINT ANALYSIS")
     print("=" * 70)
     print(f"Target: {target_addr}")
     print(f"Format: {classify_address(target_addr)}")
+    if txid_override:
+        print(f"Funding TXID (manual): {txid_override}")
     print()
 
     # Step 1: Get funding transaction
     print("Step 1: Fetching funding transaction...")
-    funding_tx = get_funding_tx(target_addr)
+    funding_tx = get_funding_tx(target_addr, txid_override=txid_override)
     if not funding_tx:
-        print("ERROR: Could not fetch funding tx")
+        print()
+        print("ERROR: Could not fetch funding tx from any API.")
+        print()
+        print("Possible causes:")
+        print("  1. Network/firewall blocking outbound HTTPS to mempool.space")
+        print("  2. Rate limit from previous scans (wait 15-30 minutes)")
+        print("  3. PowerShell SSL configuration issue")
+        print()
+        print("Workaround: pass funding TXID manually with --txid flag")
+        print("  Example:")
+        print(f"    python address_fingerprint.py {target_addr} \\")
+        print(f"      --txid e20a50da2255a2a1de74f3790b52e0080f106cadca26616be1f564b88669dccb")
         return None
 
     funding_txid = funding_tx.get('txid', '?')
@@ -458,6 +544,8 @@ def main():
                         help='Number of sister addresses to trace (default 50)')
     parser.add_argument('--delay', type=float, default=1.5,
                         help='Seconds between API requests (default 1.5)')
+    parser.add_argument('--txid',
+                        help='Funding TXID override (skip address lookup)')
     parser.add_argument('--output', default='fingerprint_report.json',
                         help='Save full report as JSON')
     args = parser.parse_args()
@@ -466,7 +554,10 @@ def main():
         print(f"ERROR: '{args.address}' is not a valid Bitcoin address")
         sys.exit(1)
 
-    result = fingerprint_analysis(args.address, args.sample_size, args.delay)
+    result = fingerprint_analysis(
+        args.address, args.sample_size, args.delay,
+        txid_override=args.txid,
+    )
 
     if result:
         with open(args.output, 'w') as f:
