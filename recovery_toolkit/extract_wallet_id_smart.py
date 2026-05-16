@@ -156,8 +156,11 @@ def main():
     )
     parser.add_argument('--browser', help='Specific browser profile path')
     parser.add_argument('--grep', help='Search any directory recursively')
+    parser.add_argument('--grep-multi', help='Multiple comma-separated paths')
     parser.add_argument('--scan', action='store_true',
                         help='Auto-scan common browser paths')
+    parser.add_argument('--all-drives', action='store_true',
+                        help='Scan ALL fixed drives (D:, E:, F:, ...) recursively')
     parser.add_argument('--proximity', type=int, default=DEFAULT_PROXIMITY,
                         help=f'Bytes around keyword (default {DEFAULT_PROXIMITY})')
     parser.add_argument('--output', default='smart_wallet_ids.txt',
@@ -173,6 +176,18 @@ def main():
         paths.append(Path(args.browser).expanduser())
     if args.grep:
         paths.append(Path(args.grep).expanduser())
+    if args.grep_multi:
+        for p in args.grep_multi.split(','):
+            p = p.strip()
+            if p:
+                paths.append(Path(p).expanduser())
+    if args.all_drives:
+        # Windows: scan D, E, F, ...
+        import string
+        for letter in string.ascii_uppercase[3:]:  # D onwards
+            drive = Path(f"{letter}:\\")
+            if drive.exists():
+                paths.append(drive)
     if args.scan:
         paths.extend(common_browser_paths())
 
