@@ -179,6 +179,11 @@ def main():
     print(f"  Gmail: https://myaccount.google.com/apppasswords")
     print()
     password = getpass.getpass("App password (hidden): ")
+    # Yahoo & Gmail App Passwords use spaces for readability (e.g. "abcd efgh ijkl mnop")
+    # but IMAP LOGIN doesn't accept spaces. Strip them.
+    password = password.replace(' ', '').replace('\t', '').strip()
+    if len(password) < 8:
+        print(f"WARNING: Password is only {len(password)} chars after stripping. App passwords are usually 16 chars.")
 
     print(f"\nConnecting to {server}...")
     try:
