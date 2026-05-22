@@ -2,41 +2,33 @@ import os
 import sys
 import hashlib
 import time
-import glob
 
 try:
     from mnemonic import Mnemonic
 except ImportError:
-    print("[!] Module 'mnemonic' belum terinstall.")
-    print("    Jalankan: pip install mnemonic")
+    print("[!] pip install mnemonic")
     sys.exit(1)
 
 try:
     from bip_utils import (
         Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes,
-        Bip32Slip10Secp256k1, WifDecoder, P2PKHAddrEncoder,
-        Secp256k1PrivateKey, BitcoinConf
+        Bip32Slip10Secp256k1
     )
 except ImportError:
-    print("[!] Module 'bip_utils' belum terinstall.")
-    print("    Jalankan: pip install bip_utils")
+    print("[!] pip install bip_utils")
     sys.exit(1)
 
 try:
     import requests
 except ImportError:
-    print("[!] Module 'requests' belum terinstall.")
-    print("    Jalankan: pip install requests")
+    print("[!] pip install requests")
     sys.exit(1)
 
-
-# ============ CONFIGURATION ============
 TARGET_ADDRESS = "1B8hgFxNK7ac2k5EtrAanxQPFcnfHLMcko"
-INPUT_FOLDER = r"D:\recovery"
+INPUT_FOLDER = os.path.dirname(os.path.abspath(__file__))
 DERIVE_COUNT = 20
 CHECK_BALANCE = True
 API_DELAY = 0.3
-# ========================================
 
 
 def base58_encode(data):
@@ -54,21 +46,8 @@ def base58_encode(data):
     return encoded
 
 
-def privkey_to_p2pkh(privkey_bytes):
-    priv = Secp256k1PrivateKey.FromBytes(privkey_bytes)
-    pub = priv.PublicKey()
-    addr = P2PKHAddrEncoder.EncodeKey(
-        pub,
-        net_ver=BitcoinConf.ParamByKey("p2pkh_net_ver")
-    )
-    return addr
-
-
-def privkey_to_p2pkh_uncompressed(privkey_bytes):
-    priv = Secp256k1PrivateKey.FromBytes(privkey_bytes)
-    pub = priv.PublicKey()
-    pub_bytes_uncompressed = pub.RawUncompressed().ToBytes()
-    sha = hashlib.sha256(b'\x04' + pub_bytes_uncompressed).digest()
+def pubkey_to_p2pkh(pubkey_bytes):
+    sha = hashlib.sha256(pubkey_bytes).digest()
     ripe = hashlib.new('ripemd160', sha).digest()
     versioned = b'\x00' + ripe
     checksum = hashlib.sha256(hashlib.sha256(versioned).digest()).digest()[:4]
@@ -106,23 +85,34 @@ def decode_wif(wif_str):
         num = 0
         for char in wif_str:
             num = num * 58 + alphabet.index(char)
-        if wif_str[0] in ('5',):
+        if wif_str[0] == '5':
             combined = num.to_bytes(37, byteorder='big')
-            privkey = combined[1:33]
-            return privkey, False
+            return combined[1:33], False
         elif wif_str[0] in ('K', 'L'):
             combined = num.to_bytes(38, byteorder='big')
-            privkey = combined[1:33]
-            return privkey, True
+            return combined[1:33], True
     except Exception:
         pass
     return None, None
 
 
-def mnemonic_to_addresses(mnemonic_str, passphrase=""):
+def privkey_to_pubkey_compressed(privkey_bytes):
+    from coincurve import PrivateKey
+    pk = PrivateKey(privkey_bytes)
+    return pk.public_key.format(compressed=True)
+
+
+def privkey_to_pubkey_uncompressed(privkey_bytes):
+    from coincurve import PrivateKey
+    pk = PrivateKey(privkey_bytes)
+    return pk.public_key.format(compressed=False)
+
+
+def mnemonic_to_addresses(mnemonic_str):
     addresses = []
     try:
-        seed = Bip39SeedGenerator(mnemonic_str).Generate(passphrase)
+        seed = Bip39SeedGenerator(mnemonic_str).Generate("")
+        # BIP44: m/44'/0'/0'/0/i
         try:
             bip44 = Bip44.FromSeed(seed, Bip44Coins.BITCOIN)
             account = bip44.Purpose().Coin().Account(0)
@@ -140,24 +130,15 @@ def mnemonic_to_addresses(mnemonic_str, passphrase=""):
                 addresses.append((addr, f"BIP44 m/44'/0'/0'/1/{i}", priv_hex))
         except Exception:
             pass
+        # BIP32: m/0/i
         try:
             master = Bip32Slip10Secp256k1.FromSeed(seed)
             for i in range(DERIVE_COUNT):
                 child = master.ChildKey(0).ChildKey(i)
                 priv_bytes = child.PrivateKey().Raw().ToBytes()
-                addr = privkey_to_p2pkh(priv_bytes)
-                priv_hex = priv_bytes.hex()
-                addresses.append((addr, f"BIP32 m/0/{i}", priv_hex))
-        except Exception:
-            pass
-        try:
-            master = Bip32Slip10Secp256k1.FromSeed(seed)
-            for i in range(DERIVE_COUNT):
-                child = master.ChildKey(Bip32Slip10Secp256k1.HardenIndex(0)).ChildKey(0).ChildKey(i)
-                priv_bytes = child.PrivateKey().Raw().ToBytes()
-                addr = privkey_to_p2pkh(priv_bytes)
-                priv_hex = priv_bytes.hex()
-                addresses.append((addr, f"BIP32 m/0'/0/{i}", priv_hex))
+                pub = privkey_to_pubkey_compressed(priv_bytes)
+                addr = pubkey_to_p2pkh(pub)
+                addresses.append((addr, f"BIP32 m/0/{i}", priv_bytes.hex()))
         except Exception:
             pass
     except Exception:
@@ -172,15 +153,16 @@ def scan_file(filepath):
             content = f.read()
     except Exception:
         return items
-    lines = content.strip().split('\n')
     m = Mnemonic("english")
-    for line in lines:
+    for line in content.strip().split('\n'):
         line = line.strip()
         if not line or line.startswith('#') or line.startswith('//'):
             continue
+        # WIF private key
         if len(line) >= 51 and len(line) <= 52 and line[0] in ('5', 'K', 'L'):
-            items.append(('privkey', line))
+            items.append(('privkey_wif', line))
             continue
+        # Hex private key
         if len(line) == 64:
             try:
                 int(line, 16)
@@ -188,161 +170,143 @@ def scan_file(filepath):
                 continue
             except ValueError:
                 pass
+        # Mnemonic
         words = line.split()
         if len(words) in (12, 15, 18, 21, 24):
             if m.check(line):
                 items.append(('mnemonic', line))
-                continue
-            else:
-                all_alpha = all(w.isalpha() for w in words)
-                if all_alpha:
-                    items.append(('mnemonic_unverified', line))
-                    continue
+            elif all(w.isalpha() for w in words):
+                items.append(('mnemonic', line))
     return items
 
 
 def main():
     print("=" * 60)
-    print("  BITCOIN P2PKH WALLET RECOVERY & BALANCE SCANNER")
+    print("  BITCOIN P2PKH WALLET RECOVERY")
     print("=" * 60)
-    print(f"  Target Address : {TARGET_ADDRESS}")
-    print(f"  Input Folder   : {INPUT_FOLDER}")
-    print(f"  Derive Count   : {DERIVE_COUNT} addresses per mnemonic")
-    print(f"  Check Balance  : {CHECK_BALANCE}")
+    print(f"  Target : {TARGET_ADDRESS}")
+    print(f"  Folder : {INPUT_FOLDER}")
     print("=" * 60)
 
-    if not os.path.exists(INPUT_FOLDER):
-        print(f"[ERROR] Folder tidak ditemukan: {INPUT_FOLDER}")
-        sys.exit(1)
-
-    print(f"[*] Scanning folder: {INPUT_FOLDER}")
-    all_files = []
-    for f in os.listdir(INPUT_FOLDER):
-        fp = os.path.join(INPUT_FOLDER, f)
-        if os.path.isfile(fp) and f.endswith(('.txt', '.csv', '.json', '.log', '.key', '.bak')):
-            all_files.append(fp)
-    print(f"[*] Ditemukan {len(all_files)} file untuk di-scan")
+    all_files = [os.path.join(INPUT_FOLDER, f) for f in os.listdir(INPUT_FOLDER)
+                 if f.endswith(('.txt', '.csv', '.json', '.log'))]
+    print(f"\n[*] Files to scan: {len(all_files)}")
 
     all_mnemonics = []
     all_privkeys = []
-    for filepath in all_files:
-        items = scan_file(filepath)
-        for item_type, item_value in items:
-            if 'mnemonic' in item_type:
-                all_mnemonics.append((item_value, filepath))
-            elif 'privkey' in item_type:
-                all_privkeys.append((item_value, item_type, filepath))
+    for fp in all_files:
+        for item_type, item_value in scan_file(fp):
+            if item_type == 'mnemonic':
+                all_mnemonics.append((item_value, fp))
+            else:
+                all_privkeys.append((item_value, item_type, fp))
 
-    print(f"[*] Total mnemonic ditemukan : {len(all_mnemonics)}")
-    print(f"[*] Total private key ditemukan: {len(all_privkeys)}")
+    print(f"[*] Mnemonics found: {len(all_mnemonics)}")
+    print(f"[*] Private keys found: {len(all_privkeys)}")
     print("-" * 60)
 
     found_target = False
-    all_addresses_found = []
+    all_addresses = []
 
+    # Process mnemonics
     if all_mnemonics:
-        print(f"[*] Processing {len(all_mnemonics)} mnemonics...")
-        for idx, (mnemonic, source_file) in enumerate(all_mnemonics):
-            short_mn = ' '.join(mnemonic.split()[:3]) + '...'
-            print(f"    [{idx+1}/{len(all_mnemonics)}] {short_mn}")
-            addresses = mnemonic_to_addresses(mnemonic)
-            for addr, path_info, priv_hex in addresses:
-                all_addresses_found.append((addr, f"Mnemonic: {short_mn} | {path_info}", priv_hex))
+        print(f"\n[*] Processing {len(all_mnemonics)} mnemonics...")
+        for idx, (mn, src) in enumerate(all_mnemonics):
+            short = ' '.join(mn.split()[:3]) + '...'
+            print(f"    [{idx+1}/{len(all_mnemonics)}] {short}")
+            for addr, path_info, priv_hex in mnemonic_to_addresses(mn):
+                all_addresses.append((addr, f"{short} | {path_info}", priv_hex))
                 if addr == TARGET_ADDRESS:
                     found_target = True
-                    print(f"  !!! TARGET FOUND !!!")
-                    print(f"  Address     : {addr}")
-                    print(f"  Mnemonic    : {mnemonic}")
-                    print(f"  Path        : {path_info}")
-                    print(f"  Private Key : {priv_hex}")
-                    print(f"  Source File : {source_file}")
+                    print(f"\n  *** TARGET FOUND ***")
+                    print(f"  Mnemonic : {mn}")
+                    print(f"  Path     : {path_info}")
+                    print(f"  PrivKey  : {priv_hex}")
+                    print(f"  Source   : {src}\n")
 
+    # Process private keys
     if all_privkeys:
-        print(f"[*] Processing {len(all_privkeys)} private keys...")
-        for idx, (privkey_str, pk_type, source_file) in enumerate(all_privkeys):
-            short_pk = privkey_str[:8] + '...'
+        print(f"\n[*] Processing {len(all_privkeys)} private keys...")
+        for idx, (pk_str, pk_type, src) in enumerate(all_privkeys):
+            short_pk = pk_str[:8] + '...'
             print(f"    [{idx+1}/{len(all_privkeys)}] {short_pk}")
             try:
                 if pk_type == 'privkey_hex':
-                    priv_bytes = bytes.fromhex(privkey_str)
-                    addr_c = privkey_to_p2pkh(priv_bytes)
-                    all_addresses_found.append((addr_c, f"PrivKey(compressed): {short_pk}", privkey_str))
-                    if addr_c == TARGET_ADDRESS:
-                        found_target = True
-                        print(f"  !!! TARGET FOUND !!!")
-                        print(f"  Private Key: {privkey_str}")
-                        print(f"  Source: {source_file}")
-                    try:
-                        addr_u = privkey_to_p2pkh_uncompressed(priv_bytes)
-                        all_addresses_found.append((addr_u, f"PrivKey(uncompressed): {short_pk}", privkey_str))
-                        if addr_u == TARGET_ADDRESS:
-                            found_target = True
-                            print(f"  !!! TARGET FOUND (uncompressed) !!!")
-                            print(f"  Private Key: {privkey_str}")
-                            print(f"  Source: {source_file}")
-                    except Exception:
-                        pass
-                elif pk_type == 'privkey':
-                    priv_bytes, compressed = decode_wif(privkey_str)
-                    if priv_bytes:
-                        addr = privkey_to_p2pkh(priv_bytes)
-                        all_addresses_found.append((addr, f"PrivKey(WIF): {short_pk}", priv_bytes.hex()))
-                        if addr == TARGET_ADDRESS:
-                            found_target = True
-                            print(f"  !!! TARGET FOUND !!!")
-                            print(f"  WIF Key: {privkey_str}")
-                            print(f"  Source: {source_file}")
+                    priv_bytes = bytes.fromhex(pk_str)
+                elif pk_type == 'privkey_wif':
+                    priv_bytes, compressed = decode_wif(pk_str)
+                    if not priv_bytes:
+                        continue
+                else:
+                    continue
+                # Compressed address
+                pub_c = privkey_to_pubkey_compressed(priv_bytes)
+                addr_c = pubkey_to_p2pkh(pub_c)
+                all_addresses.append((addr_c, f"PK(c): {short_pk}", priv_bytes.hex()))
+                if addr_c == TARGET_ADDRESS:
+                    found_target = True
+                    print(f"\n  *** TARGET FOUND (compressed) ***")
+                    print(f"  PrivKey: {pk_str}")
+                    print(f"  Source : {src}\n")
+                # Uncompressed address
+                pub_u = privkey_to_pubkey_uncompressed(priv_bytes)
+                addr_u = pubkey_to_p2pkh(pub_u)
+                all_addresses.append((addr_u, f"PK(u): {short_pk}", priv_bytes.hex()))
+                if addr_u == TARGET_ADDRESS:
+                    found_target = True
+                    print(f"\n  *** TARGET FOUND (uncompressed) ***")
+                    print(f"  PrivKey: {pk_str}")
+                    print(f"  Source : {src}\n")
             except Exception:
                 pass
 
-    print("=" * 60)
-    print("  SCAN COMPLETE")
-    print(f"  Total addresses generated: {len(all_addresses_found)}")
-    print(f"  Target match found: {'YES !!!' if found_target else 'NO'}")
+    print("\n" + "=" * 60)
+    print(f"  SCAN COMPLETE")
+    print(f"  Total addresses: {len(all_addresses)}")
+    print(f"  Target found: {'YES!!!' if found_target else 'NO'}")
     print("=" * 60)
 
-    if CHECK_BALANCE and all_addresses_found:
-        print(f"[*] Checking balances for {len(all_addresses_found)} addresses...")
+    # Check balances
+    if CHECK_BALANCE and all_addresses:
+        print(f"\n[*] Checking balances ({len(all_addresses)} addresses)...")
+        unique_addrs = list(set([a[0] for a in all_addresses]))
         wallets_with_balance = []
-        unique_addresses = list(set([a[0] for a in all_addresses_found]))
-        batch_size = 80
-        for i in range(0, len(unique_addresses), batch_size):
-            batch = unique_addresses[i:i+batch_size]
-            print(f"    Checking batch {i//batch_size + 1}/{(len(unique_addresses)-1)//batch_size + 1}...")
+        batch_size = 50
+        for i in range(0, len(unique_addrs), batch_size):
+            batch = unique_addrs[i:i+batch_size]
+            print(f"    Batch {i//batch_size+1}/{(len(unique_addrs)-1)//batch_size+1}...")
             balances = get_balance_batch(batch)
-            for addr, balance in balances.items():
-                if balance and balance > 0:
-                    source_info = ""
-                    priv_key = ""
-                    for a, s, p in all_addresses_found:
+            for addr, bal in balances.items():
+                if bal > 0:
+                    for a, s, p in all_addresses:
                         if a == addr:
-                            source_info = s
-                            priv_key = p
+                            wallets_with_balance.append((addr, bal, s, p))
                             break
-                    wallets_with_balance.append((addr, balance, source_info, priv_key))
             time.sleep(API_DELAY)
 
         if wallets_with_balance:
+            print(f"\n{'='*60}")
             print(f"  WALLETS WITH BALANCE: {len(wallets_with_balance)}")
-            for addr, balance, source, pk in wallets_with_balance:
-                btc = balance / 100_000_000
-                print(f"  Address : {addr}")
-                print(f"  Balance : {btc:.8f} BTC ({balance} sat)")
-                print(f"  Source  : {source}")
-                print(f"  PrivKey : {pk}")
+            print(f"{'='*60}")
+            for addr, bal, source, pk in wallets_with_balance:
+                btc = bal / 100_000_000
+                print(f"  {addr}")
+                print(f"  Balance: {btc:.8f} BTC")
+                print(f"  Source : {source}")
+                print(f"  Key    : {pk}")
                 print()
         else:
-            print("  Tidak ada wallet dengan saldo > 0.")
+            print("  No wallets with balance found.")
 
-    results_file = os.path.join(INPUT_FOLDER, "recovery_results.txt")
-    with open(results_file, 'w') as f:
-        f.write(f"Target: {TARGET_ADDRESS}\n")
-        f.write(f"Found: {found_target}\n")
-        f.write(f"Total scanned: {len(all_addresses_found)}\n\n")
-        for addr, source, pk in all_addresses_found:
-            marker = "*** MATCH ***" if addr == TARGET_ADDRESS else ""
-            f.write(f"{marker} {addr} | {source} | {pk}\n")
-    print(f"[*] Results saved to: {results_file}")
+    # Save results
+    out_file = os.path.join(INPUT_FOLDER, "results.txt")
+    with open(out_file, 'w') as f:
+        f.write(f"Target: {TARGET_ADDRESS}\nFound: {found_target}\n")
+        f.write(f"Total: {len(all_addresses)}\n\n")
+        for addr, src, pk in all_addresses:
+            tag = "MATCH!" if addr == TARGET_ADDRESS else ""
+            f.write(f"{tag} {addr} | {src} | {pk}\n")
+    print(f"\n[*] Results saved: {out_file}")
     print("[DONE]")
 
 
