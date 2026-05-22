@@ -26,7 +26,7 @@ except ImportError:
 
 TARGET_ADDRESS = "1B8hgFxNK7ac2k5EtrAanxQPFcnfHLMcko"
 INPUT_FOLDER = os.path.dirname(os.path.abspath(__file__))
-DERIVE_COUNT = 20
+DERIVE_COUNT = 100
 CHECK_BALANCE = True
 API_DELAY = 0.3
 
@@ -112,7 +112,8 @@ def mnemonic_to_addresses(mnemonic_str):
     addresses = []
     try:
         seed = Bip39SeedGenerator(mnemonic_str).Generate("")
-        # BIP44: m/44'/0'/0'/0/i
+
+        # BIP44: m/44'/0'/0'/0/i (external)
         try:
             bip44 = Bip44.FromSeed(seed, Bip44Coins.BITCOIN)
             account = bip44.Purpose().Coin().Account(0)
@@ -122,6 +123,7 @@ def mnemonic_to_addresses(mnemonic_str):
                 addr = addr_obj.PublicKey().ToAddress()
                 priv_hex = addr_obj.PrivateKey().Raw().ToHex()
                 addresses.append((addr, f"BIP44 m/44'/0'/0'/0/{i}", priv_hex))
+            # BIP44: m/44'/0'/0'/1/i (change)
             chain_int = account.Change(Bip44Changes.CHAIN_INT)
             for i in range(DERIVE_COUNT):
                 addr_obj = chain_int.AddressIndex(i)
@@ -130,7 +132,34 @@ def mnemonic_to_addresses(mnemonic_str):
                 addresses.append((addr, f"BIP44 m/44'/0'/0'/1/{i}", priv_hex))
         except Exception:
             pass
-        # BIP32: m/0/i
+
+        # BIP44 Account 1: m/44'/0'/1'/0/i
+        try:
+            bip44 = Bip44.FromSeed(seed, Bip44Coins.BITCOIN)
+            account1 = bip44.Purpose().Coin().Account(1)
+            chain_ext1 = account1.Change(Bip44Changes.CHAIN_EXT)
+            for i in range(DERIVE_COUNT):
+                addr_obj = chain_ext1.AddressIndex(i)
+                addr = addr_obj.PublicKey().ToAddress()
+                priv_hex = addr_obj.PrivateKey().Raw().ToHex()
+                addresses.append((addr, f"BIP44 m/44'/0'/1'/0/{i}", priv_hex))
+        except Exception:
+            pass
+
+        # BIP44 Account 2: m/44'/0'/2'/0/i
+        try:
+            bip44 = Bip44.FromSeed(seed, Bip44Coins.BITCOIN)
+            account2 = bip44.Purpose().Coin().Account(2)
+            chain_ext2 = account2.Change(Bip44Changes.CHAIN_EXT)
+            for i in range(DERIVE_COUNT):
+                addr_obj = chain_ext2.AddressIndex(i)
+                addr = addr_obj.PublicKey().ToAddress()
+                priv_hex = addr_obj.PrivateKey().Raw().ToHex()
+                addresses.append((addr, f"BIP44 m/44'/0'/2'/0/{i}", priv_hex))
+        except Exception:
+            pass
+
+        # BIP32: m/0/i (Electrum-like)
         try:
             master = Bip32Slip10Secp256k1.FromSeed(seed)
             for i in range(DERIVE_COUNT):
@@ -141,6 +170,60 @@ def mnemonic_to_addresses(mnemonic_str):
                 addresses.append((addr, f"BIP32 m/0/{i}", priv_bytes.hex()))
         except Exception:
             pass
+
+        # BIP32: m/0'/0/i
+        try:
+            master = Bip32Slip10Secp256k1.FromSeed(seed)
+            h0 = master.ChildKey(Bip32Slip10Secp256k1.HardenIndex(0))
+            for i in range(DERIVE_COUNT):
+                child = h0.ChildKey(0).ChildKey(i)
+                priv_bytes = child.PrivateKey().Raw().ToBytes()
+                pub = privkey_to_pubkey_compressed(priv_bytes)
+                addr = pubkey_to_p2pkh(pub)
+                addresses.append((addr, f"BIP32 m/0'/0/{i}", priv_bytes.hex()))
+        except Exception:
+            pass
+
+        # BIP32: m/0'/0'/i (Bitcoin Core style)
+        try:
+            master = Bip32Slip10Secp256k1.FromSeed(seed)
+            h0 = master.ChildKey(Bip32Slip10Secp256k1.HardenIndex(0))
+            h0b = h0.ChildKey(Bip32Slip10Secp256k1.HardenIndex(0))
+            for i in range(DERIVE_COUNT):
+                child = h0b.ChildKey(i)
+                priv_bytes = child.PrivateKey().Raw().ToBytes()
+                pub = privkey_to_pubkey_compressed(priv_bytes)
+                addr = pubkey_to_p2pkh(pub)
+                addresses.append((addr, f"BIP32 m/0'/0'/{i}", priv_bytes.hex()))
+        except Exception:
+            pass
+
+        # Direct from master key (m/i)
+        try:
+            master = Bip32Slip10Secp256k1.FromSeed(seed)
+            for i in range(DERIVE_COUNT):
+                child = master.ChildKey(i)
+                priv_bytes = child.PrivateKey().Raw().ToBytes()
+                pub = privkey_to_pubkey_compressed(priv_bytes)
+                addr = pubkey_to_p2pkh(pub)
+                addresses.append((addr, f"BIP32 m/{i}", priv_bytes.hex()))
+        except Exception:
+            pass
+
+        # Also try uncompressed for BIP44 first address
+        try:
+            bip44 = Bip44.FromSeed(seed, Bip44Coins.BITCOIN)
+            account = bip44.Purpose().Coin().Account(0)
+            chain_ext = account.Change(Bip44Changes.CHAIN_EXT)
+            for i in range(20):
+                addr_obj = chain_ext.AddressIndex(i)
+                priv_bytes = addr_obj.PrivateKey().Raw().ToBytes()
+                pub_u = privkey_to_pubkey_uncompressed(priv_bytes)
+                addr_u = pubkey_to_p2pkh(pub_u)
+                addresses.append((addr_u, f"BIP44(uncomp) m/44'/0'/0'/0/{i}", priv_bytes.hex()))
+        except Exception:
+            pass
+
     except Exception:
         pass
     return addresses
@@ -182,10 +265,11 @@ def scan_file(filepath):
 
 def main():
     print("=" * 60)
-    print("  BITCOIN P2PKH WALLET RECOVERY")
+    print("  BITCOIN P2PKH WALLET RECOVERY v2")
     print("=" * 60)
     print(f"  Target : {TARGET_ADDRESS}")
     print(f"  Folder : {INPUT_FOLDER}")
+    print(f"  Derive : {DERIVE_COUNT} per path")
     print("=" * 60)
 
     all_files = [os.path.join(INPUT_FOLDER, f) for f in os.listdir(INPUT_FOLDER)
@@ -210,7 +294,7 @@ def main():
 
     # Process mnemonics
     if all_mnemonics:
-        print(f"\n[*] Processing {len(all_mnemonics)} mnemonics...")
+        print(f"\n[*] Processing {len(all_mnemonics)} mnemonics (deep scan)...")
         for idx, (mn, src) in enumerate(all_mnemonics):
             short = ' '.join(mn.split()[:3]) + '...'
             print(f"    [{idx+1}/{len(all_mnemonics)}] {short}")
@@ -239,7 +323,7 @@ def main():
                         continue
                 else:
                     continue
-                # Compressed address
+                # Compressed
                 pub_c = privkey_to_pubkey_compressed(priv_bytes)
                 addr_c = pubkey_to_p2pkh(pub_c)
                 all_addresses.append((addr_c, f"PK(c): {short_pk}", priv_bytes.hex()))
@@ -248,7 +332,7 @@ def main():
                     print(f"\n  *** TARGET FOUND (compressed) ***")
                     print(f"  PrivKey: {pk_str}")
                     print(f"  Source : {src}\n")
-                # Uncompressed address
+                # Uncompressed
                 pub_u = privkey_to_pubkey_uncompressed(priv_bytes)
                 addr_u = pubkey_to_p2pkh(pub_u)
                 all_addresses.append((addr_u, f"PK(u): {short_pk}", priv_bytes.hex()))
